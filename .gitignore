@@ -1,0 +1,14 @@
+# Julia package — regenerated, never committed
+Manifest.toml
+/docs/build/
+/docs/Manifest.toml
+
+# Coverage / profiling
+*.jl.cov
+*.jl.*.cov
+*.jl.mem
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
