@@ -338,12 +338,17 @@ function to_dataframe(data::Vector)
         cols = Dict{Symbol,Vector}()
 
         for field in fields
-            values = [getfield(d, field) for d in data]
-            # Convert non-primitive types to strings
-            if !all(v -> v isa Union{Number,String,Bool,Missing,Nothing} for v in values)
-                values = [string(v) for v in values]
+            col = Any[getfield(d, field) for d in data]
+            # CSV can't emit a raw `nothing`; normalize it to `missing` (empty cell).
+            col = Any[v === nothing ? missing : v for v in col]
+            # Stringify anything that isn't a CSV-native scalar. NOTE: the two-arg
+            # `all(f, itr)` form is required here — `all(v -> pred for v in itr)`
+            # parses as a generator of closures and throws "non-boolean used in
+            # boolean context".
+            if !all(v -> v isa Union{Number,String,Bool,Missing}, col)
+                col = Any[v isa Missing ? missing : string(v) for v in col]
             end
-            cols[field] = values
+            cols[field] = col
         end
 
         return DataFrame(cols)

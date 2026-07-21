@@ -40,13 +40,8 @@ function symbols(binary_path::String; filter::Symbol=:all, demangled::Bool=true)
         error("Binary not found: $binary_path")
     end
 
-    # Check if nm tool is available
-    nm_tool = get_tool("nm")
-    if isempty(nm_tool)
-        nm_tool = "nm"  # Fallback to system nm
-    end
-
-    # Use existing Compiler function to extract symbols
+    # Symbol extraction is delegated to the core's extract_symbols_from_binary, which
+    # locates `nm` through RepliBuild's own toolchain; we just structure the result.
     raw_symbols = extract_symbols_from_binary(binary_path)
 
     # Convert to SymbolInfo structs
@@ -369,23 +364,24 @@ function disassemble(binary_path::String, symbol=nothing; syntax::Symbol=:att)
         return ""
     end
 
-    # Filter by symbol if provided
+    # Filter by symbol if provided. objdump prints one block per function, headed by
+    # an `<addr> <name>:` line and terminated by a blank line. Both instruction lines
+    # and their call-target annotations contain '<', so the block must be bounded by
+    # that header/blank-line structure — the previous logic broke on the first '<'
+    # (e.g. a `call <other_fn>`) and truncated the output after one or two lines.
     if symbol !== nothing
-        lines = split(output, '\n')
+        header_re = r"^[0-9a-fA-F]+ <.+>:"
         filtered_lines = String[]
         in_symbol = false
 
-        for line in lines
-            if occursin("<$symbol>:", line)
-                in_symbol = true
-            elseif in_symbol && occursin(r"^[0-9a-f]+:", line)
-                # Continue collecting instructions
-            elseif in_symbol && (isempty(strip(line)) || occursin('<', line))
-                # End of symbol
-                break
-            end
-
-            if in_symbol
+        for line in split(output, '\n')
+            s = strip(line)
+            if occursin(header_re, s)
+                # Entering a new function block; collect only if it is the target.
+                in_symbol = occursin("<$symbol>:", s)
+                in_symbol && push!(filtered_lines, line)
+            elseif in_symbol
+                isempty(s) && break     # blank line terminates this function's block
                 push!(filtered_lines, line)
             end
         end
@@ -456,23 +452,26 @@ function headers(binary_path::String)
         end
     end
 
-    # Parse sections
+    # Parse sections. readelf -S columns are: [Nr] Name Type Address Off Size ES Flg Lk Inf Al
+    # The bracketed index prints as "[ 1]" (two whitespace-split tokens) or "[10]"
+    # (one), and both Name and Flg can be empty, so positional token indexing is
+    # unreliable. Anchor instead on the Address column — the first 8–16 hex-digit
+    # token — with Off and Size the two tokens after it and Name the tokens before Type.
     sections = Tuple{String,Int,Int}[]
     for line in split(section_output, '\n')
-        # Section format: [ Nr] Name Type Addr Off Size
-        if occursin(r"^\s*\[\s*\d+\]", line)
-            parts = split(line)
-            if length(parts) >= 6
-                name = parts[2]
-                # Try to parse offset and size
-                offset = tryparse(Int, parts[5], base=16)
-                size = tryparse(Int, parts[6], base=16)
+        m = match(r"^\s*\[\s*\d+\]\s*(.*)$", line)
+        m === nothing && continue
+        toks = split(m.captures[1])
+        addr_idx = findfirst(t -> occursin(r"^[0-9a-fA-F]{8,16}$", t), toks)
+        (addr_idx === nothing || addr_idx + 2 > length(toks)) && continue
 
-                if offset !== nothing && size !== nothing
-                    push!(sections, (name, offset, size))
-                end
-            end
-        end
+        offset = tryparse(Int, toks[addr_idx + 1], base=16)
+        size = tryparse(Int, toks[addr_idx + 2], base=16)
+        (offset === nothing || size === nothing) && continue
+
+        # Name is everything before the Type column (the token just before Address).
+        name = addr_idx >= 3 ? join(toks[1:addr_idx - 2], " ") : ""
+        push!(sections, (name, offset, size))
     end
 
     return HeaderInfo(

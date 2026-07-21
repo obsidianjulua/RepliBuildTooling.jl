@@ -47,7 +47,7 @@ function llvm_ir(bitcode_path::String)
     end
 
     # Count instructions
-    instruction_count = count(l -> occursin(r"^\s+%|^\s+[a-z]+", l), split(ir_output, '\n'))
+    instruction_count = count_ir_instructions(ir_output)
 
     # Extract function name from IR
     func_match = match(r"define .* @([A-Za-z0-9_\.]+)\(", ir_output)
@@ -107,7 +107,7 @@ function optimize_ir(ir_path::String, opt_level::String; passes=nothing)
 
     # Read original IR
     original_ir = read(ir_path, String)
-    instructions_before = count(l -> occursin(r"^\s+%|^\s+[a-z]+", l), split(original_ir, '\n'))
+    instructions_before = count_ir_instructions(original_ir)
 
     # Build opt arguments
     args = if passes !== nothing
@@ -128,7 +128,7 @@ function optimize_ir(ir_path::String, opt_level::String; passes=nothing)
     end
 
     # Count instructions after
-    instructions_after = count(l -> occursin(r"^\s+%|^\s+[a-z]+", l), split(optimized_ir, '\n'))
+    instructions_after = count_ir_instructions(optimized_ir)
 
     # Calculate reduction
     reduction = if instructions_before > 0
@@ -313,17 +313,29 @@ println("Basic blocks: \$(analysis[:basic_block_count])")
 ```
 """
 function analyze_ir_structure(ir::String)
-    lines = split(ir, '\n')
+    # Single pass over the IR — one `eachsplit` traversal tallying every construct at
+    # once, instead of one `split` (materializing the whole line vector) followed by
+    # eight separate scans of it. Same regexes, same results, far less overhead on the
+    # large whole-module dumps this is typically handed.
+    function_count = 0
+    basic_block_count = 0
+    call_count = 0
+    load_count = 0
+    store_count = 0
+    alloca_count = 0
+    phi_count = 0
+    getelementptr_count = 0
 
-    # Count various IR constructs
-    function_count = count(l -> occursin(r"^define", l), lines)
-    basic_block_count = count(l -> occursin(r"^[a-zA-Z0-9_]+:", l), lines)
-    call_count = count(l -> occursin(r"\s+call\s+", l), lines)
-    load_count = count(l -> occursin(r"\s+load\s+", l), lines)
-    store_count = count(l -> occursin(r"\s+store\s+", l), lines)
-    alloca_count = count(l -> occursin(r"\s+alloca\s+", l), lines)
-    phi_count = count(l -> occursin(r"\s+phi\s+", l), lines)
-    getelementptr_count = count(l -> occursin(r"\s+getelementptr\s+", l), lines)
+    for line in eachsplit(ir, '\n')
+        occursin(r"^define", line)             && (function_count += 1)
+        occursin(r"^[a-zA-Z0-9_]+:", line)     && (basic_block_count += 1)
+        occursin(r"\s+call\s+", line)          && (call_count += 1)
+        occursin(r"\s+load\s+", line)          && (load_count += 1)
+        occursin(r"\s+store\s+", line)         && (store_count += 1)
+        occursin(r"\s+alloca\s+", line)        && (alloca_count += 1)
+        occursin(r"\s+phi\s+", line)           && (phi_count += 1)
+        occursin(r"\s+getelementptr\s+", line) && (getelementptr_count += 1)
+    end
 
     return Dict(
         :function_count => function_count,
@@ -358,10 +370,10 @@ println("Functions: \$(join(funcs, ", "))")
 function extract_function_names(ir::String)
     function_names = String[]
 
-    for line in split(ir, '\n')
+    for line in eachsplit(ir, '\n')
         m = match(r"define .* @([A-Za-z0-9_\.]+)\(", line)
         if m !== nothing
-            push!(function_names, m.captures[1])
+            push!(function_names, String(m.captures[1]))
         end
     end
 
@@ -399,8 +411,8 @@ function compare_ir_files(ir1_path::String, ir2_path::String)
     analysis2 = analyze_ir_structure(ir2)
 
     # Calculate differences
-    instruction_count1 = count(l -> occursin(r"^\s+%|^\s+[a-z]+", l), split(ir1, '\n'))
-    instruction_count2 = count(l -> occursin(r"^\s+%|^\s+[a-z]+", l), split(ir2, '\n'))
+    instruction_count1 = count_ir_instructions(ir1)
+    instruction_count2 = count_ir_instructions(ir2)
 
     reduction = if instruction_count1 > 0
         ((instruction_count1 - instruction_count2) / instruction_count1) * 100.0

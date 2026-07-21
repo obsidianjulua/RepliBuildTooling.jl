@@ -168,7 +168,7 @@ function code_llvm(func, types::Tuple; optimized::Bool=true, raw::Bool=false, de
     func_name = string(func)
 
     # Count instructions (lines starting with % or indented)
-    instruction_count = count(l -> occursin(r"^\s+%|^\s+[a-z]+", l), split(ir, '\n'))
+    instruction_count = count_ir_instructions(ir)
 
     return LLVMIRInfo(
         func_name,
@@ -261,53 +261,59 @@ end
 ```
 """
 function analyze_type_stability(func, types::Tuple)
-    # Get warntype output
-    warntype_output = code_warntype(func, types)
+    # Work directly from the inferred (typed, unoptimized) IR rather than parsing
+    # `@code_warntype` text. Text parsing is fragile: in a non-color IO Julia signals
+    # instability by UPPERCASING types (e.g. `Body::UNION{…}`), which a `"Union"`/`"Any"`
+    # substring check silently misses — reporting unstable functions as stable.
+    result = InteractiveUtils.code_typed(func, types; optimize=false)
+    if isempty(result)
+        error("Could not get typed code for $func$types")
+    end
+    ci, return_type = result[1]
 
-    # Parse for type instabilities
     unstable_vars = TypeInstability[]
     warnings = String[]
 
-    lines = split(warntype_output, '\n')
-    for line in lines
-        # Look for type instability markers (Union, Any with !)
-        if occursin(r"\b(Union|Any)\b", line) && occursin('!', line)
-            # Try to extract variable name
-            if occursin(r"%\d+", line)
-                var_match = match(r"%(\d+)", line)
-                if var_match !== nothing
-                    var_name = "%$(var_match.captures[1])"
+    # Flatten a Union into its component types (avoids depending on the non-public
+    # Base.uniontypes; a Union's `.a`/`.b` fields are stable structure).
+    union_components(t) = t isa Union ? vcat(union_components(t.a), union_components(t.b)) : Any[t]
+    # A small Union of *concrete* leaves (e.g. the ubiquitous `Union{Nothing,Tuple}`
+    # from the iteration protocol) is benign: it's union-split, not a real instability.
+    benign_union(t) = t isa Union && all(isconcretetype, union_components(t))
+    # A genuine instability: a real `Type` that is neither concrete, bottom, nor a
+    # benign concrete-leaf Union. Lattice elements that aren't plain `Type`s
+    # (Core.Const, PartialStruct, …) are refinements, so they're never flagged. This
+    # mirrors what `@code_warntype` prints in red (vs. the yellow benign unions).
+    is_problematic(t) = (t isa Type) && t !== Union{} && !isconcretetype(t) && !benign_union(t)
 
-                    # Try to extract inferred type
-                    type_match = match(r"::\s*([A-Za-z0-9_{}.,\s]+)", line)
-                    inferred_type = if type_match !== nothing
-                        try
-                            eval(Meta.parse(strip(type_match.captures[1])))
-                        catch
-                            Any
-                        end
-                    else
-                        Any
-                    end
-
-                    push!(unstable_vars, TypeInstability(
-                        var_name,
-                        inferred_type,
-                        nothing,
-                        nothing
-                    ))
-                end
+    # Scan inferred SSA value types for the origins of instability (informational).
+    # Only value-producing statements are meaningful: in unoptimized typed IR every
+    # statement gets a type slot, but control-flow nodes (goto/return/gotoifnot) are
+    # placeholder-typed `Any` — inspecting those would flag every branch as unstable.
+    ssatypes = ci.ssavaluetypes
+    code = ci.code
+    if ssatypes isa AbstractVector && code isa AbstractVector
+        for i in eachindex(ssatypes)
+            (i <= length(code) && (code[i] isa Expr || code[i] isa Core.PhiNode)) || continue
+            t = ssatypes[i]
+            if is_problematic(t)
+                push!(unstable_vars, TypeInstability("%$i", t, nothing, nothing))
             end
-        end
-
-        # Collect warnings
-        if occursin("WARNING", line) || occursin("!", line)
-            push!(warnings, strip(line))
         end
     end
 
-    # Determine if fully stable
-    is_stable = isempty(unstable_vars) && !occursin("Union", warntype_output) && !occursin("Any", warntype_output)
+    # Verdict follows the canonical definition (what `Test.@inferred` enforces): the
+    # function is type-stable iff its inferred return type is concrete. Benign
+    # union-split intermediates therefore never flip the verdict.
+    return_concrete = (return_type isa Type) && return_type !== Union{} && isconcretetype(return_type)
+    is_stable = return_concrete
+
+    if !return_concrete
+        push!(warnings, "non-concrete return type: $(return_type)")
+    end
+    if !isempty(unstable_vars)
+        push!(warnings, "$(length(unstable_vars)) intermediate value(s) with non-concrete inferred type")
+    end
 
     func_name = string(func)
 

@@ -59,32 +59,34 @@ function benchmark(func, args...; samples::Int=1000, warmup::Int=10)
         end
     end
 
-    # Collect samples
+    # Collect per-sample measurements
     times = Vector{Float64}(undef, samples)
-    allocations = Vector{Int}(undef, samples)
-    memory = Vector{Int}(undef, samples)
+    alloc_counts = Vector{Int}(undef, samples)
+    alloc_bytes = Vector{Int}(undef, samples)
     gc_times = Vector{Float64}(undef, samples)
 
     for i in 1:samples
-        # Measure
         stats = @timed func(args...)
 
-        times[i] = stats.time * 1e9  # Convert to nanoseconds
-        allocations[i] = stats.gcstats.allocd > 0 ? 1 : 0  # Count allocations
-        memory[i] = stats.gcstats.allocd
-        gc_times[i] = stats.gcstats.total_time * 1e9  # Convert to nanoseconds
+        times[i]        = stats.time * 1e9                     # ns
+        alloc_counts[i] = Base.gc_alloc_count(stats.gcstats)   # true allocation count for this call
+        alloc_bytes[i]  = stats.gcstats.allocd                 # bytes allocated by this call
+        gc_times[i]     = stats.gcstats.total_time * 1e9       # ns
     end
 
-    # Calculate statistics
+    # Timing statistics
     median_time = median(times)
     mean_time = mean(times)
     std_time = std(times)
     min_time = minimum(times)
     max_time = maximum(times)
 
-    total_allocations = sum(allocations)
-    total_memory = sum(memory)
-    total_gc_time = sum(gc_times)
+    # Allocation/GC metrics are reported PER CALL (a representative sample), not
+    # summed across all samples — allocation count is deterministic per call, so
+    # the median is the right representative and matches BenchmarkTools semantics.
+    per_call_allocations = round(Int, median(alloc_counts))
+    per_call_memory = round(Int, median(alloc_bytes))
+    per_call_gc_time = median(gc_times)
 
     # Extract function name
     func_name = string(func)
@@ -97,9 +99,9 @@ function benchmark(func, args...; samples::Int=1000, warmup::Int=10)
         std_time,
         min_time,
         max_time,
-        total_allocations,
-        total_memory,
-        total_gc_time,
+        per_call_allocations,
+        per_call_memory,
+        per_call_gc_time,
         now()
     )
 end
@@ -200,7 +202,7 @@ function track_allocations(func, args...)
     return Dict(
         :function => string(func),
         :time => stats.time,
-        :allocations => stats.gcstats.allocd > 0 ? 1 : 0,
+        :allocations => Base.gc_alloc_count(stats.gcstats),
         :total_bytes => stats.gcstats.allocd,
         :gc_time => stats.gcstats.total_time,
         :gc_pause_time => stats.gcstats.pause,

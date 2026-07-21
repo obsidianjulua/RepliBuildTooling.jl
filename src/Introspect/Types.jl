@@ -533,9 +533,9 @@ Standalone benchmark result with timing and allocation metrics.
 - `std_time::Float64` - Standard deviation (nanoseconds)
 - `min_time::Float64` - Minimum time (nanoseconds)
 - `max_time::Float64` - Maximum time (nanoseconds)
-- `allocations::Int` - Number of allocations
-- `memory::Int` - Total memory allocated (bytes)
-- `gc_time::Float64` - Time spent in GC (nanoseconds)
+- `allocations::Int` - Number of allocations per call
+- `memory::Int` - Memory allocated per call (bytes)
+- `gc_time::Float64` - Time spent in GC per call (nanoseconds)
 - `timestamp::DateTime` - When benchmark was run
 """
 struct BenchmarkResult
@@ -565,6 +565,26 @@ end
 # ============================================================================
 # UTILITY FUNCTIONS
 # ============================================================================
+
+# Shared LLVM-IR instruction-line matcher: an SSA assignment (`  %x = …`) or an
+# indented mnemonic (`  ret …`, `  br …`, `  store …`). Defined once and reused so
+# the heuristic stays identical across every module that counts IR size.
+const IR_INSTRUCTION_RE = r"^\s+%|^\s+[a-z]+"
+
+"""
+    count_ir_instructions(ir::AbstractString) -> Int
+
+Count instruction lines in LLVM IR text. Single pass over the string via
+`eachsplit`, so it never materializes the full line vector — meaningful on the
+hundred-KB whole-module `.ll`/`.bc` dumps this package routinely handles.
+"""
+function count_ir_instructions(ir::AbstractString)
+    n = 0
+    for line in eachsplit(ir, '\n')
+        occursin(IR_INSTRUCTION_RE, line) && (n += 1)
+    end
+    return n
+end
 
 """Format time in appropriate units"""
 function format_time(ns::Float64)
