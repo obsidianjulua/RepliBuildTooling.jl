@@ -1,5 +1,6 @@
 using RepliBuildTooling
 using Test
+using JSON        # synthetic metadata for the api-surface tests
 const T = RepliBuildTooling
 
 # ---------------------------------------------------------------------------
@@ -217,5 +218,117 @@ end
                 end
             end
         end
+    end
+
+    # -----------------------------------------------------------------------
+    # API surface. Synthetic metadata only — the classification is a pure
+    # function of the symbol table, so it needs no toolchain, no built package
+    # and no fixture, and therefore always runs.
+    #
+    # The shapes below are the three real ones, and the third is why the
+    # strategy exists at all: a naive "C linkage == public" rule reports
+    # pugixml and box2d as having ZERO public functions, which is worse than
+    # no filter. Each shape is asserted against what a user would ask for.
+    # -----------------------------------------------------------------------
+    @testset "api surface" begin
+        fn(name, mangled, ret, params; src="dwarf") = Dict(
+            "name" => name, "mangled" => mangled,
+            "return_type" => Dict("c_type" => ret),
+            "parameters" => [Dict("name" => n, "c_type" => t) for (n, t) in params],
+            "parameters_source" => src)
+
+        function write_md(fns; structs = Dict())
+            p = joinpath(mktempdir(), "compilation_metadata.json")
+            open(p, "w") do io
+                JSON.print(io, Dict("functions" => fns, "struct_definitions" => structs))
+            end
+            return p
+        end
+
+        # (a) C API over a C++ implementation — llama.cpp's shape (34% C).
+        mixed = write_md(vcat(
+            [fn("lib_open", "lib_open", "lib_ctx*", [("path", "const char*")]),
+             fn("lib_close", "lib_close", "void", [("ctx", "lib_ctx*")]),
+             fn("lib_read", "lib_read", "int", [("ctx", "lib_ctx*")]),
+             fn("lib_write", "lib_write", "int", [("ctx", "lib_ctx*")])],
+            [fn("impl_step$i", "_ZN4impl4stepEv", "void", []) for i in 1:20]))
+        s = T.api_surface(mixed)
+        @test s.strategy === :c_linkage
+        @test length(s.functions) == 4
+        @test length(s.internal) == 20
+        @test only(T.api(s, "open")).name == "lib_open"
+        @test isempty(T.api(s, "impl_step"))                  # internals hidden…
+        @test length(T.api(s, "impl_step"; internals=true)) == 20  # …but reachable
+
+        # (b) Pure C — everything is the API.
+        purec = write_md([fn("z_deflate", "z_deflate", "int", []),
+                          fn("z_inflate", "z_inflate", "int", [])])
+        s = T.api_surface(purec)
+        @test s.strategy === :c_linkage
+        @test length(s.functions) == 2
+
+        # (c) C++ API — linkage carries no signal. Includes ONE incidental
+        # extern "C" symbol, which is tinyxml2's real shape (1 of 284) and the
+        # case a bare "any C linkage wins" rule gets wrong.
+        cpp = write_md(vcat(
+            [fn("xml_document::load_string", "_ZN12xml_document11load_stringEPKc",
+                "xml_parse_result", [("s", "const char*")])],
+            [fn("xml_node::child$i", "_ZN8xml_node5childEi", "xml_node", []) for i in 1:30],
+            [fn("std::vector<int>::push_back", "_ZNSt6vectorIiE9push_backEi", "void", [])],
+            [fn("_incidental_c", "_incidental_c", "void", [])]))
+        s = T.api_surface(cpp)
+        @test s.strategy === :cpp
+        @test only(T.api(s, "load_string")).name == "xml_document::load_string"
+        @test any(f -> occursin("std::", f.name), s.internal)   # STL is internal
+        @test !any(f -> occursin("std::", f.name), s.functions)
+        # The defect this guards: :c_linkage here yields one function, and it
+        # is the incidental symbol rather than any part of the API.
+        naive = T.api_surface(cpp; strategy = :c_linkage)
+        @test length(naive.functions) == 1
+        @test only(naive.functions).name == "_incidental_c"
+
+        @test T.api_surface(cpp; strategy = :all).strategy === :all
+        @test_throws ErrorException T.api_surface(cpp; strategy = :nonsense)
+
+        # The :auto threshold is a heuristic, so pin it deliberately rather
+        # than letting some fixture's incidental ratio pin it by accident.
+        # Real spread it has to separate: tinyxml2 0.35% C vs llama.cpp 34%.
+        ratio(n_c, n_cpp) = T.api_surface(write_md(vcat(
+            [fn("c$i", "c$i", "void", []) for i in 1:n_c],
+            [fn("m$i", "_ZN1x1yEv", "void", []) for i in 1:n_cpp]))).strategy
+        @test ratio(20, 79) === :c_linkage    # 20.2% — comfortably a C API
+        @test ratio(1, 999) === :cpp          # 0.1%  — an incidental extern "C"
+        @test T.C_API_FRACTION == 0.10
+
+        # Struct fields, and by-value vs pointer — '*' must not be stripped, or
+        # a pointer parameter is reported as a by-value crossing.
+        md = write_md([fn("take", "take", "int",
+                          [("ctx", "big_t*"), ("v", "small_t"), ("b", "big_t")])],
+                      structs = Dict(
+                          "small_t" => Dict("byte_size" => "0x8",
+                                            "members" => [Dict("name" => "a", "offset" => "0x0",
+                                                               "c_type" => "int64_t")]),
+                          "big_t"   => Dict("byte_size" => "0x28",
+                                            "members" => [Dict("name" => "x", "offset" => "0x0",
+                                                               "c_type" => "int32_t"),
+                                                          Dict("name" => "y", "offset" => "0x8",
+                                                               "c_type" => "double")])))
+        s = T.api_surface(md)
+        bv = T.byvalue_args(only(T.api(s, "take")), s)
+        @test length(bv) == 2                          # ctx is a POINTER
+        @test all(a -> a.name != "ctx", bv)
+        @test (name = "v", type = "small_t", bytes = 8,  class = :register) in bv
+        @test (name = "b", type = "big_t",   bytes = 40, class = :memory)   in bv
+
+        flds = T.api_struct(s, "big_t")
+        @test [f.name for f in flds] == ["x", "y"]
+        @test [f.offset for f in flds] == [0, 8]       # hex parsed, not string
+        @test_throws ErrorException T.api_struct(s, "no_such_struct")
+
+        # Inferred parameters are flagged, since they did not come from DWARF.
+        inf = write_md([fn("guessed", "guessed", "void", [("arg1", "int")]; src="inferred")])
+        @test occursin("inferred", sprint(show, only(T.api(T.api_surface(inf)))))
+
+        @test_throws ErrorException T.api_surface(mktempdir())   # no metadata
     end
 end

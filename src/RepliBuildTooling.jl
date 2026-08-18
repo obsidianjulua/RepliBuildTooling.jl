@@ -31,11 +31,16 @@ include("Introspect/Julia.jl")
 include("Introspect/LLVM.jl")
 include("Introspect/Benchmarking.jl")
 include("Introspect/Project.jl")
+include("Introspect/Api.jl")
 
 # Re-export public APIs from submodules
 
 # Project Introspection
 export project_artifacts, lto_ir, aot_ir, aot_symbols
+
+# API Surface — which of a wrapper's thousands of definitions are callable API
+export api, api_surface, api_struct, byvalue_args, signature
+export ApiFunction, ApiSurface
 
 # Binary Introspection
 export symbols, dwarf_info, disassemble, headers, dwarf_dump
