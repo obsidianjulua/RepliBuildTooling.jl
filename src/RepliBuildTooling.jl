@@ -32,6 +32,7 @@ include("Introspect/LLVM.jl")
 include("Introspect/Benchmarking.jl")
 include("Introspect/Project.jl")
 include("Introspect/Api.jl")
+include("Introspect/CMakeHarvest.jl")
 
 # Re-export public APIs from submodules
 
@@ -44,6 +45,11 @@ export ApiFunction, ApiSurface
 
 # Binary Introspection
 export symbols, dwarf_info, disassemble, headers, dwarf_dump
+
+# CMake Build-System Introspection — harvest configure-time generated headers
+# and the intended compile flags from an upstream tree, without running a build
+export cmake_probe, harvest_config, propose_toml, uniform, main_target
+export CMakeProbe, CMakeTarget
 
 # Julia Introspection
 export code_lowered, code_typed, code_llvm, code_native, code_warntype

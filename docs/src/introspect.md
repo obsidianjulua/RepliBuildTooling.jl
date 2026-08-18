@@ -63,6 +63,62 @@ RepliBuildTooling.export_csv
 RepliBuildTooling.export_dataset
 ```
 
+## CMake Build-System Introspection
+
+Some libraries cannot be compiled from a bare checkout: their headers are produced by
+feature detection (`configure_file` over a `config.h.in`), so the files the build needs
+do not exist in git. RepliBuild compiles all-sources-minus-excludes under one uniform
+flag set and never runs a configure step, which would rule those libraries out
+entirely.
+
+cmake's **configure** step is not its build step, though — it is a self-contained
+feature-detection pass that emits the generated headers and, with
+`CMAKE_EXPORT_COMPILE_COMMANDS`, a full record of how upstream intends to compile every
+translation unit. Both are readable in seconds without a compiler touching a real
+source file. These tools read that build system rather than running one.
+
+```julia
+using RepliBuildTooling
+
+# Configure only — no build. `args` turns off tests/tools/optional deps.
+probe = cmake_probe("/path/to/checkout";
+                    name      = "pcre2",
+                    clone_rel = ".replibuild_cache/deps/pcre2",
+                    args      = ["-DPCRE2_BUILD_TESTS=OFF", "-DPCRE2_SUPPORT_JIT=OFF"])
+
+display(probe)          # generated files, targets, per-target uniformity verdict
+uniform(probe)          # can RepliBuild's single flag set reproduce this?
+
+harvest_config(probe, "config")   # copy generated headers/sources + write HARVEST.md
+println(propose_toml(probe; language="c", shim_headers=["pcre2.h"]))
+```
+
+`propose_toml` renders the **structural** half of a `replibuild.toml`: the real `-D`/`-I`
+set, and the exclude list derived as the set difference between every source in the tree
+and the TUs the chosen target compiles. It is a proposal to read, not a manifest to
+paste blind — and it can never produce the residue half (`[wrap.varargs]`,
+`[wrap.macros]`), which is precisely what the preprocessor erased before the build
+system saw it.
+
+A project routinely configures the same sources into several targets (shared, static,
+and a compat shim is the common trio). That is not per-file flag divergence, so
+uniformity is judged per target and [`main_target`](@ref) picks which one to build from.
+
+Libraries that defer generation to a *build rule* rather than to configure (libpng's
+`pnglibconf.h` comes out of an awk pipeline wired as a custom command) yield no
+generated headers here. That empty result is the signal to look for a shipped fallback
+or to use `RepliBuild.ingest()` instead.
+
+```@docs
+RepliBuildTooling.cmake_probe
+RepliBuildTooling.harvest_config
+RepliBuildTooling.propose_toml
+RepliBuildTooling.main_target
+RepliBuildTooling.uniform
+RepliBuildTooling.CMakeProbe
+RepliBuildTooling.CMakeTarget
+```
+
 ## Real-World Workflow: Analyzing a Slow Function
 
 Suppose you have a wrapped C++ function `compute_physics` that isn't performing as expected. Here is how you can use the introspection toolkit to diagnose the issue.
