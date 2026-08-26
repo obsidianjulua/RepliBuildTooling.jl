@@ -38,8 +38,7 @@ end
                      :llvm_ir, :optimize_ir, :run_passes,
                      :benchmark, :benchmark_suite, :track_allocations,
                      :export_json, :export_csv, :export_dataset, :to_dataframe,
-                     :cmake_probe, :harvest_config, :propose_toml, :main_target,
-                     :BenchmarkResult, :DWARFInfo, :LLVMIRInfo, :CMakeProbe)
+                     :BenchmarkResult, :DWARFInfo, :LLVMIRInfo)
             @test isdefined(RepliBuildTooling, name)
         end
         # The core-backend seam is wired (imported by name from RepliBuild)
@@ -333,104 +332,4 @@ end
         @test_throws ErrorException T.api_surface(mktempdir())   # no metadata
     end
 
-    # -- CMake harvest: parsing internals, pure, always run ---------------------
-    @testset "cmake harvest internals" begin
-        # A flag signature must drop everything file-specific, or two TUs that
-        # share a flag set would look divergent purely because their names differ.
-        sig = T._flag_signature(["/usr/bin/cc", "-DFOO=1", "-I/inc", "-O2",
-                                 "-o", "CMakeFiles/x.dir/a.c.o", "-c", "src/a.c"])
-        @test sig == ["-DFOO=1", "-I/inc", "-O2"]
-        @test T._flag_signature(["cc", "-DA", "-o", "b.o", "-c", "b.cpp"]) == ["-DA"]
-
-        # Target extraction, from the `output` field and from -o as a fallback.
-        @test T._target_of(Dict("output" => "CMakeFiles/mylib.dir/src/a.c.o"), String[]) == "mylib"
-        @test T._target_of(Dict{String,Any}(), ["cc", "-o", "CMakeFiles/z.dir/a.c.o"]) == "z"
-        @test T._target_of(Dict("output" => "weird/path.o"), String[]) == ""
-
-        @test T._is_cmake_internal("CMakeFiles/3.31/CompilerIdC/CMakeCCompilerId.c")
-        @test T._is_cmake_internal("_deps/foo-src/x.h")
-        @test !T._is_cmake_internal("config.h")
-
-        # Include translation: build-tree -> the package's config dir, source
-        # tree -> clone-relative, anything else (system/external) dropped.
-        inc = T._translate_includes(["-I/src/lib", "-I/bld", "-I/usr/include", "-I/src"],
-                                    "/src", "/bld", "config", "deps/x")
-        @test inc == ["deps/x/lib", "config"]
-
-        # Exclusion collapsing prefers the shallowest wholly-dead directory. A
-        # directory that still holds compiled sources must stay per-file, since a
-        # coarse pattern there would silently drop live code.
-        ex = T._collapse_excludes(["src/a.c", "src/b.c"],
-                                  ["src/skip.c", "tools/x.c", "tools/deep/y.c"])
-        @test "tools/" in ex
-        @test "src/skip.c" in ex
-        @test !("src/" in ex)
-        @test !("tools/deep/" in ex)      # already covered by tools/
-
-        # Directory names the resolver prunes on its own are not proposed.
-        @test isempty(T._collapse_excludes(["src/a.c"], ["tests/t.c"]))
-    end
-
-    # -- CMake harvest end-to-end, gated on cmake being installed ---------------
-    if Sys.which("cmake") === nothing
-        @info "cmake not found — skipping cmake_probe end-to-end test."
-    else
-        @testset "cmake harvest end-to-end" begin
-            src = mktempdir()
-            write(joinpath(src, "CMakeLists.txt"), """
-                cmake_minimum_required(VERSION 3.10)
-                project(fixt C)
-                set(FIXT_GREETING "hello")
-                configure_file(fixt_config.h.in fixt_config.h)
-                add_library(fixt \${LIBKIND} a.c b.c)
-                target_include_directories(fixt PRIVATE \${CMAKE_CURRENT_BINARY_DIR})
-                target_compile_definitions(fixt PRIVATE HAVE_CONFIG_H)
-                """)
-            write(joinpath(src, "fixt_config.h.in"),
-                  "#define FIXT_GREETING \"@FIXT_GREETING@\"\n")
-            write(joinpath(src, "a.c"), "int a(void) { return 1; }\n")
-            write(joinpath(src, "b.c"), "int b(void) { return 2; }\n")
-            # Never referenced by any target — must show up as an exclusion.
-            write(joinpath(src, "orphan.c"), "int orphan(void) { return 3; }\n")
-            mkpath(joinpath(src, "tools"))
-            write(joinpath(src, "tools", "cli.c"), "int main(void) { return 0; }\n")
-
-            gen = Sys.which("ninja") === nothing ? "Unix Makefiles" : "Ninja"
-            probe = T.cmake_probe(src; name="fixt", generator=gen,
-                                  clone_rel="deps/fixt", use_llvm_env=false)
-
-            # The generated header is the whole point: it does not exist in the
-            # source tree, only in the build tree, and only after configure.
-            @test "fixt_config.h" in probe.generated_headers
-            @test !isfile(joinpath(src, "fixt_config.h"))
-
-            t = T.main_target(probe)
-            @test t !== nothing
-            @test t.name == "fixt"
-            @test T.uniform(t)
-            @test sort(t.files) == ["a.c", "b.c"]
-            @test "-DHAVE_CONFIG_H" in t.defines
-            @test "config" in t.include_dirs      # the build dir, remapped
-
-            # Sources no target compiles become exclusions.
-            frag = T.propose_toml(probe; language="c")
-            @test occursin("orphan.c", frag)
-            @test occursin("tools/", frag)
-            @test occursin("-DHAVE_CONFIG_H", frag)
-            @test !occursin("\"a.c\"", frag)      # live source must not be excluded
-
-            # Harvest copies the header out and leaves a provenance note.
-            out = mktempdir()
-            written = T.harvest_config(probe, out)
-            @test length(written) == 1
-            @test isfile(joinpath(out, "fixt_config.h"))
-            @test occursin("hello", read(joinpath(out, "fixt_config.h"), String))
-            @test isfile(joinpath(out, "HARVEST.md"))
-            @test occursin("cmake_probe", read(joinpath(out, "HARVEST.md"), String))
-
-            rm(src; recursive=true, force=true)
-            rm(out; recursive=true, force=true)
-            rm(probe.build_dir; recursive=true, force=true)
-        end
-    end
 end
